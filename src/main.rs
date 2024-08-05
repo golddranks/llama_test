@@ -70,14 +70,13 @@ impl TokenOutputStream {
     }
 }
 
-
 const EOS_TOKEN: &str = "</s>";
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
 
 fn main() -> Result<(), E> {
     println!("start");
-    let device = Device::Cpu;
-    let dtype = DType::F16;
+    let device = Device::new_cuda(0)?;
+    let dtype = DType::BF16;
     let repeat_penalty = 1.1;
     let repeat_last_n = 128;
     let temperature = 0.8;
@@ -85,50 +84,42 @@ fn main() -> Result<(), E> {
     let top_p = None;
     let seed = 299792458;
     let sample_len = 10000;
-    let tokenizer_filename = "./Meta-Llama-3.1-8B-Instruct/tokenizer.json";
+    let path = "./Meta-Llama-3.1-8B-Instruct";
+    let config_filename = format!("{path}/config.json");
+    let tokenizer_filename = format!("{path}/tokenizer.json");
 
-    let safetensors_files = [
-        "./Meta-Llama-3.1-8B-Instruct/model-00001-of-00004.safetensors",
-        "./Meta-Llama-3.1-8B-Instruct/model-00002-of-00004.safetensors",
-        "./Meta-Llama-3.1-8B-Instruct/model-00003-of-00004.safetensors",
-        "./Meta-Llama-3.1-8B-Instruct/model-00004-of-00004.safetensors",
-    ];
-
-    let config = model::LlamaConfig {
-        hidden_size: 4096,
-        intermediate_size: 14336,
-        vocab_size: 128256,
-        num_hidden_layers: 32,
-        num_attention_heads: 32,
-        num_key_value_heads: Some(8),
-        rms_norm_eps: 1e-05,
-        rope_theta: 500000.0,
-        bos_token_id: Some(128000),
-        eos_token_id: Some(model::LlamaEosToks::Multiple(vec![
-            128001,
-            128008,
-            128009
-          ])),
-        rope_scaling: Some(model::Llama3RopeConfig {
-            factor: 8.0,
-            low_freq_factor: 1.0,
-            high_freq_factor: 4.0,
-            original_max_position_embeddings: 8192,
-            rope_type: model::Llama3RopeType::Llama3,
-        }),
-        max_position_embeddings: 131072,
-    };
+    let config: model::LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
     let config = config.into_config(false);
     println!("config ready");
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safetensors_files, dtype, &device)? };
-    println!("vb ready");
+
     let mut cache = model::Cache::new(true, dtype, &config, &device)?;
     println!("cache ready");
+
+    let tokenizer = Tokenizer::from_file(tokenizer_filename)?;
+    println!("tokenizer ready");
+
+    let safetensors_index_filename = format!("{path}/model.safetensors.index.json");
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(safetensors_index_filename)?)?;
+    let mut safetensors_files = std::collections::HashSet::new();
+    if let Some(serde_json::Value::Object(weight_map)) = json.get("weight_map") {
+        for value in weight_map.values() {
+            if let Some(file) = value.as_str() {
+                safetensors_files.insert(format!("{path}/{file}"));
+            }
+        }
+    }
+    let safetensors_files = safetensors_files.into_iter().collect::<Vec<_>>();
+
+    // Testing 4-bit quantized models:
+    //let safetensors_files = vec![format!("{path}/model.safetensors")];
+
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safetensors_files, dtype, &device)? };
+    println!("vb ready");
+
     let llama = model::Llama::load(vb, &config)?;
 
     println!("model ready");
-    let tokenizer = Tokenizer::from_file(tokenizer_filename)?;
-    println!("tokenizer ready");
     let eos_token_id = config.eos_token_id.or_else(|| {
         tokenizer
             .token_to_id(EOS_TOKEN)
@@ -136,10 +127,7 @@ fn main() -> Result<(), E> {
     });
     let prompt = DEFAULT_PROMPT;
     println!("tokenizing the prompt");
-    let mut tokens = tokenizer
-        .encode(prompt, true)?
-        .get_ids()
-        .to_vec();
+    let mut tokens = tokenizer.encode(prompt, true)?.get_ids().to_vec();
     println!("tokenized!");
     let mut tokenizer = TokenOutputStream::new(tokenizer);
 
